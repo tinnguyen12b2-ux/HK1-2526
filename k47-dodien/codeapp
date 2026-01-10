@@ -1,0 +1,1846 @@
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:provider/provider.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'firebase_options.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'dart:async';
+import 'package:intl/intl.dart';
+import 'dart:typed_data'; // Thêm dòng này
+import 'dart:io';         // Thêm dòng này
+import 'package:screenshot/screenshot.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:gal/gal.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:math';
+
+
+
+// ---- Notification setup ----
+final FlutterLocalNotificationsPlugin localNotifications = FlutterLocalNotificationsPlugin();
+
+Future<void> _initNotifications() async {
+  const AndroidInitializationSettings androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initSettings = InitializationSettings(android: androidInit);
+  await localNotifications.initialize(initSettings);
+  await FirebaseMessaging.instance.requestPermission();
+}
+
+// Show local notification
+Future<void> showAlertNotification(String title, String body) async {
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'alert_channel', 'Alerts', importance: Importance.max, priority: Priority.high,
+  );
+  const NotificationDetails details = NotificationDetails(android: androidDetails);
+  await localNotifications.show(0, title, body, details);
+}
+
+// ---- App State ----
+class AppState extends ChangeNotifier {
+  final db = FirebaseDatabase.instance;
+
+  // Tách biệt đường dẫn để tránh ESP32 ghi đè dữ liệu
+  DatabaseReference get sensorsRef => db.ref('esp32/sensors'); 
+  DatabaseReference get controlRef => db.ref('esp32/control');
+  DatabaseReference get historyRef => db.ref('esp32/history');
+  DatabaseReference get configRef => db.ref('app/config');
+  DatabaseReference get billingRef => db.ref('app/billing_history');
+  DatabaseReference get resetOffsetRef => db.ref('app/reset_offset_kwh');
+
+  
+  // --- THÊM MỚI: Đường dẫn mật mã xác thực ---
+  DatabaseReference get authRef => db.ref('app/auth');
+  // Đường dẫn reset PIN trên Firebase
+  DatabaseReference get resetPinRef => db.ref('app/reset_pin');
+
+
+  Map status = {};
+  double pricePerKwh = 0;
+
+  // Thêm vào AppState (ngay dưới Map status, pricePerKwh, v.v.)
+  double _resetOffset = 0.0;
+  double get resetOffset => _resetOffset;
+
+
+
+
+  
+  // --- THÊM MỚI: Biến lưu mã PIN (Mặc định 12345) ---
+  String appPin = "12345";
+
+  Map<dynamic, dynamic>? historyData;
+
+  String _resetPin = "12345"; // Mật mã mặc định
+  String get resetPin => _resetPin;
+
+  // Hàm này để tải mật mã khi vừa mở App
+  
+
+  // Hàm này để đổi mật mã mới
+  Future<void> updateResetPin(String newPin) async {
+  await resetPinRef.set(newPin); // Lưu lên Firebase
+  _resetPin = newPin;
+  notifyListeners();
+}
+
+  
+  double get totalAllTimeKwh {
+    double total = 0.0;
+    if (historyData == null) return 0.0;
+    
+    historyData!.forEach((key, value) {
+      // Ép kiểu double để tránh lỗi nếu Firebase trả về số nguyên
+      var dailyValue = value['daily_total_kwh'];
+      if (dailyValue is int) {
+        total += dailyValue.toDouble();
+      } else if (dailyValue is double) {
+        total += dailyValue;
+      }
+    });
+    return total;
+  }
+  
+  AppState() {
+    
+    // 1. Lắng nghe dữ liệu cảm biến
+    sensorsRef.onValue.listen((event) {
+      final data = event.snapshot.value as Map?;
+      if (data != null) {
+        status = {...status, ...data};
+        notifyListeners();
+        // ... giữ nguyên logic xử lý thông báo cũ của bạn ...
+        final state = data['alert_state'] ?? 'normal';
+        final power = (data['power'] ?? 0).toString();
+        if (state == 'alert') {
+          showAlertNotification('Cảnh báo công suất', 'P = $power W vượt ngưỡng 1');
+        } else if (state == 'danger') {
+          showAlertNotification('Nguy hiểm công suất', 'P = $power W vượt ngưỡng 2');
+        }
+      }
+    });
+    
+    historyRef.onValue.listen((event) {
+      if (event.snapshot.value != null) {
+        historyData = event.snapshot.value as Map?;
+        notifyListeners();
+      }
+    });
+    // 2. Lắng nghe trạng thái điều khiển
+    controlRef.onValue.listen((event) {
+      final data = event.snapshot.value as Map?;
+      if (data != null) {
+        status = {...status, ...data};
+        notifyListeners();
+      }
+    });
+
+    // Lắng nghe cấu hình giá điện
+    configRef.onValue.listen((event) {
+      final data = event.snapshot.value as Map?;
+      if (data != null && data.containsKey('price_per_kwh_vnd')) {
+        pricePerKwh = (data['price_per_kwh_vnd'] as num).toDouble();
+        notifyListeners();
+      }
+    });
+
+    // --- THÊM MỚI: Lắng nghe mật mã từ Firebase ---
+    authRef.onValue.listen((event) {
+      if (event.snapshot.value != null) {
+        appPin = event.snapshot.value.toString();
+        notifyListeners();
+      }
+    });
+
+    resetPinRef.onValue.listen((event) {
+      if (event.snapshot.value != null) {
+        _resetPin = event.snapshot.value.toString();
+        notifyListeners();
+      }
+    });
+
+    resetOffsetRef.onValue.listen((event) {
+  if (event.snapshot.value != null) {
+    _resetOffset = double.tryParse(event.snapshot.value.toString()) ?? 0.0;
+    notifyListeners();
+  }
+});
+
+
+  }
+
+  double calculateUsage(DateTime selectedDate, bool isMonthView) {
+    double total = 0.0;
+    if (historyData == null) return 0.0;
+
+    String dateKey = DateFormat('dd-MM-yyyy').format(selectedDate);
+    String monthYearKey = DateFormat('MM-yyyy').format(selectedDate);
+
+    if (isMonthView) {
+      historyData!.forEach((key, value) {
+        if (key.toString().contains(monthYearKey)) {
+          total += (value['daily_total_kwh'] ?? 0.0);
+        }
+      });
+    } else {
+      if (historyData!.containsKey(dateKey)) {
+        total = (historyData![dateKey]['daily_total_kwh'] ?? 0.0);
+      }
+    }
+    return total;
+  }
+
+  // --- THÊM MỚI: Hàm đổi mật mã PIN ---
+  Future<void> updateAppPin(String newPin) async {
+    await authRef.set(newPin);
+  }
+
+  
+  // --- CÁC HÀM CŨ GIỮ NGUYÊN ---
+  Future<void> setRelay(int idx, bool on) async {
+    status['relay$idx'] = on;
+    notifyListeners();
+    await controlRef.child('relay$idx').set(on);
+  }
+
+  Future<void> setAlertEnabled(bool enabled) async {
+    status['alert_enabled'] = enabled;
+    notifyListeners();
+    await controlRef.update({'alert_enabled': enabled});
+  }
+
+  Future<void> setThresholds({double? alert, double? danger}) async {
+    Map<String, Object> up = {};
+    if (alert != null) {
+      up['alert_threshold_w'] = alert;
+      status['alert_threshold_w'] = alert;
+    }
+    if (danger != null) {
+      up['danger_threshold_w'] = danger;
+      status['danger_threshold_w'] = danger;
+    }
+    if (up.isNotEmpty) {
+      await controlRef.update(up);
+      notifyListeners();
+    }
+  }
+
+  Future<void> setPricePerKwh(double price) async {
+    await configRef.update({'price_per_kwh_vnd': price});
+    pricePerKwh = price;
+    notifyListeners();
+  }
+
+  Future<void> addBillingEntry(String month, double totalKwh, double price, double totalCost) async {
+    await billingRef.push().set({
+      'month': month,
+      'total_kwh': totalKwh,
+      'price_per_kwh_vnd': price,
+      'total_cost_vnd': totalCost,
+      'timestamp_ms': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  // Trong AppState.dart
+// Sửa hàm cũ thành hàm này để nghe dữ liệu thời gian thực
+Stream<DatabaseEvent> getHistoryStream(String dateStr) {
+  return db.ref('esp32/history/$dateStr').onValue;
+    }
+ 
+
+ 
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  await _initNotifications();
+  runApp(const EnergyApp());
+}
+
+
+class EnergyApp extends StatelessWidget {
+  const EnergyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (_) => AppState(),
+      child: MaterialApp(
+        title: 'Energy Monitor',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+          useMaterial3: true,
+        ),
+        home: const HomeScreen(),
+      ),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int index = 0;
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      const MainTab(),
+      const PowerChartTab(),
+      HistoryTab(),
+      BillingTab(),
+      const SettingsTab(),
+    ];
+    return Scaffold(
+      appBar: AppBar(title: const Text('Giám sát & Điều khiển tủ điện')),
+      body: pages[index],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: index,
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Chính'),
+          NavigationDestination(icon: Icon(Icons.show_chart), label: 'Đồ thị'),
+          NavigationDestination(icon: Icon(Icons.history), selectedIcon: Icon(Icons.history_toggle_off), label: 'Lịch sử'),
+          NavigationDestination(icon: Icon(Icons.payments_outlined), selectedIcon: Icon(Icons.payments), label: 'Tính tiền'),
+          NavigationDestination(icon: Icon(Icons.settings), label: 'Cài đặt'),
+        ],
+        onDestinationSelected: (i) => setState(() => index = i),
+      ),
+    );
+  }
+}
+
+// ---- Main tab ----
+class MainTab extends StatefulWidget {
+  const MainTab({super.key});
+  @override
+  State<MainTab> createState() => _MainTabState();
+}
+
+class _MainTabState extends State<MainTab> {
+  
+
+  bool showThresholds = false;
+  final alertCtrl = TextEditingController();
+  final dangerCtrl = TextEditingController();
+
+  final alertFocus = FocusNode();
+  final dangerFocus = FocusNode();
+
+  late Timer _timer;
+  String _currentTime = "";
+
+  // --- THÊM MỚI: Biến lưu mốc Reset ---
+  
+
+  // --- THÊM MỚI: Hàm tải mốc reset từ bộ nhớ máy ---
+  
+
+  // --- THÊM MỚI: Hàm xử lý Reset ---
+Future<void> _handleReset(double currentTotalAllTime) async {
+  // Ghi offset lên Firebase để ESP32 cũng đọc được
+  final app = context.read<AppState>();
+  await app.resetOffsetRef.set(currentTotalAllTime);
+
+
+  if (mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Đã reset chỉ số điện năng về 0!')),
+    );
+  }
+}
+
+
+  Future<void> _verifyAndSetAlert(BuildContext context, AppState app, bool newValue) async {
+    final codeCtrl = TextEditingController();
+
+    return showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Xác nhận bảo mật'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Vui lòng nhập mật mã 5 số:'),
+            TextField(
+              controller: codeCtrl,
+              keyboardType: TextInputType.number,
+              obscureText: true,
+              maxLength: 5,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Mật mã'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('HỦY')),
+          ElevatedButton(
+            onPressed: () {
+              if (codeCtrl.text == app.appPin) {
+                app.setAlertEnabled(newValue);
+                setState(() => showThresholds = newValue);
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Xác thực thành công!')),
+                );
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Sai mật mã!'),
+                    backgroundColor: Colors.red,
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              }
+            },
+            child: const Text('XÁC NHẬN'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _verifyAndResetEnergy(BuildContext context, AppState app, double currentTotal) async {
+  final codeCtrl = TextEditingController();
+
+  return showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: const Text('Xác nhận Reset'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text('Vui lòng nhập mật mã 5 số:'),
+          TextField(
+            controller: codeCtrl,
+            keyboardType: TextInputType.number,
+            obscureText: true,
+            maxLength: 5,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Mật mã'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context), 
+          child: const Text('HỦY')
+        ),
+       // Trong hàm xử lý khi nhấn nút RESET ở Tab Chính
+ElevatedButton(
+  onPressed: () {
+    if (codeCtrl.text == app.resetPin) { // So sánh với mã trong AppState
+      _handleReset(app.totalAllTimeKwh); // Thực hiện reset về 0
+      Navigator.pop(context);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sai mật mã Reset!'), backgroundColor: Colors.red),
+      );
+    }
+  },
+  child: const Text('XÁC NHẬN'),
+)
+      ],
+    ),
+  );
+}
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    alertFocus.dispose();
+    dangerFocus.dispose();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) {
+        setState(() {
+          _currentTime = DateFormat('dd/MM/yyyy - HH:mm:ss').format(DateTime.now());
+        });
+      }
+    });
+
+    final app = context.read<AppState>();
+    final s = app.status;
+    alertCtrl.text = (s['alert_threshold_w'] ?? '').toString();
+    dangerCtrl.text = (s['danger_threshold_w'] ?? '').toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final app = context.watch<AppState>();
+    final s = app.status;
+
+    // --- LOGIC TÍNH TỔNG TẤT CẢ CÁC NGÀY ---
+    double totalAllTime = 0.0;
+    if (app.historyData != null) {
+      app.historyData!.forEach((key, value) {
+        totalAllTime += (value['daily_total_kwh'] ?? 0.0);
+      });
+    }
+
+    // Số hiển thị = Tổng thật - Mốc đã reset
+    double displayKwh = totalAllTime - app.resetOffset;
+
+    if (displayKwh < 0) displayKwh = 0;
+
+    if (!alertFocus.hasFocus && s['alert_threshold_w'] != null) {
+      alertCtrl.text = s['alert_threshold_w'].toString();
+    }
+    if (!dangerFocus.hasFocus && s['danger_threshold_w'] != null) {
+      dangerCtrl.text = s['danger_threshold_w'].toString();
+    }
+
+    return Column(
+      children: [
+        _buildConnectionStatus(app),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              children: [
+                // --- CARD HIỂN THỊ ĐIỆN NĂNG TÍCH LŨY + NÚT RESET ---
+                // --- CARD HIỂN THỊ ĐIỆN NĂNG TÍCH LŨY ---
+Card(
+  color: Colors.teal.shade50,
+  elevation: 4,
+  child: Padding(
+    padding: const EdgeInsets.all(16),
+    child: Column(
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.history_toggle_off, color: Colors.teal),
+                SizedBox(width: 8),
+                Text('Điện năng tiêu thụ',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              ],
+            ),
+            // THAY ĐỔI TẠI ĐÂY: Nút icon thành nút Chữ Reset
+            TextButton(
+              onPressed: () => _verifyAndResetEnergy(context, app, totalAllTime),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.red,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+              ),
+              child: const Text(
+                "RESET",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+            )
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          "${displayKwh.toStringAsFixed(2)} kWh",
+          style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Colors.teal),
+        ),
+        const Text("Dữ liệu cộng dồn từ tất cả lịch sử", 
+          style: TextStyle(fontSize: 10, color: Colors.grey)),
+      ],
+    ),
+  ),
+),
+                const SizedBox(height: 10),
+
+                // Metrics: các thông số khác giữ nguyên
+                _metricRow(Icons.flash_on, 'Điện áp (V)', s['voltage']),
+                _metricRow(Icons.bolt, 'Công suất (W)', s['power'] ?? s['powerW']),
+                _metricRow(Icons.bolt, 'Dòng điện (A)', s['current']),
+                // Đã đưa điện năng lên Card trên nên có thể bỏ dòng _metricRow cũ của điện năng ở đây
+                _metricRow(Icons.speed, 'Tần số (Hz)', s['frequency']),
+                _metricRow(Icons.stacked_line_chart, 'Hệ số công suất', s['power_factor']),
+                _metricRow(Icons.thermostat, 'Nhiệt độ (°C)', s['temperature_c']),
+                _metricRow(Icons.water_drop, 'Độ ẩm (%)', s['humidity_pct']),
+                const SizedBox(height: 16),
+
+                // ---- Controls ----
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(Icons.power_settings_new),
+                            SizedBox(width: 8),
+                            Text('Điều khiển'),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        // Quạt
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(children: [
+                              Icon(
+                                Icons.air,
+                                size: 32,
+                                color: (s['relay1'] ?? false) ? Colors.green : Colors.black,
+                              ),
+                              const SizedBox(width: 8),
+                              const Text('Quạt'),
+                            ]),
+                            Switch(
+                              value: (s['relay1'] ?? false) as bool,
+                              onChanged: (v) => app.setRelay(1, v),
+                            ),
+                          ],
+                        ),
+                        // Đèn
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(children: [
+                              Icon(
+                                Icons.lightbulb,
+                                size: 32,
+                                color: (s['relay2'] ?? false) ? Colors.amber : Colors.black,
+                              ),
+                              const SizedBox(width: 8),
+                              const Text('Đèn'),
+                            ]),
+                            Switch(
+                              value: (s['relay2'] ?? false) as bool,
+                              onChanged: (v) => app.setRelay(2, v),
+                            ),
+                          ],
+                        ),
+                        const Divider(),
+                        // Cảnh báo
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(children: [
+                              Icon(
+                                Icons.warning_amber,
+                                color: (s['alert_enabled'] ?? true) ? Colors.red : Colors.black,
+                              ),
+                              const SizedBox(width: 8),
+                              const Text('Chế độ cảnh báo'),
+                            ]),
+                            Switch(
+                              value: (s['alert_enabled'] ?? true) as bool,
+                              onChanged: (v) {
+                                _verifyAndSetAlert(context, app, v);
+                              },
+                            ),
+                          ],
+                        ),
+                        if (showThresholds || (s['alert_enabled'] ?? true) == true) ...[
+                          const SizedBox(height: 8),
+                          _thresholdInput(
+                            context,
+                            'Ngưỡng cảnh báo (W)',
+                            s['alert_threshold_w'],
+                            alertCtrl,
+                            alertFocus,
+                            (val) async {
+                              final v = double.tryParse(val);
+                              if (v != null) {
+                                await app.setThresholds(alert: v);
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('Lưu ngưỡng cảnh báo thành công!')),
+                                  );
+                                }
+                              }
+                            },
+                          ),
+                          _thresholdInput(
+                            context,
+                            'Ngưỡng nguy hiểm (W)',
+                            s['danger_threshold_w'],
+                            dangerCtrl,
+                            dangerFocus,
+                            (val) async {
+                              final v = double.tryParse(val);
+                              if (v != null) {
+                                await app.setThresholds(danger: v);
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('Lưu ngưỡng nguy hiểm thành công!')),
+                                  );
+                                }
+                              }
+                            },
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _alertBanner(s['alert_state'], s['power'] ?? s['powerW']),
+              ],
+            ),
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          width: double.infinity,
+          color: Colors.grey.shade200,
+          child: Text(
+            _currentTime,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 12, color: Colors.grey, fontWeight: FontWeight.bold),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // --- Các Widget phụ giữ nguyên ---
+  Widget _metricRow(IconData icon, String label, dynamic value) {
+    Color iconColor = Colors.teal;
+    if (label.contains('Điện áp')) iconColor = Colors.orange;
+    if (label.contains('Công suất')) iconColor = Colors.red;
+    if (label.contains('Dòng điện')) iconColor = Colors.blue;
+    if (label.contains('Nhiệt độ')) iconColor = Colors.deepOrange;
+    if (label.contains('Độ ẩm')) iconColor = Colors.cyan;
+    if (label.contains('Tần số')) iconColor = Colors.purple;
+    if (label.contains('Hệ số công suất')) iconColor = Colors.pink;
+
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Row(children: [
+              Icon(icon, size: 28, color: iconColor),
+              const SizedBox(width: 12),
+              Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            ]),
+            Text(value == null ? '--' : value.toString(),
+                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _thresholdInput(BuildContext context, String label, dynamic current,
+      TextEditingController ctrl, FocusNode fNode, Function(String) onSave) {
+    return Row(
+      children: [
+        Expanded(child: Text(label)),
+        SizedBox(
+          width: 100, // Thu nhỏ lại chút cho vừa hàng
+          child: TextField(
+            controller: ctrl,
+            focusNode: fNode,
+            decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+            keyboardType: TextInputType.number,
+            onSubmitted: (val) => onSave(val),
+          ),
+        ),
+        const SizedBox(width: 8),
+        IconButton(
+          icon: const Icon(Icons.save, color: Colors.teal),
+          onPressed: () {
+            onSave(ctrl.text);
+            fNode.unfocus();
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _alertBanner(dynamic alertState, dynamic power) {
+    final s = (alertState ?? 'normal') as String;
+    Color bg;
+    IconData ic;
+    String text;
+    if (s == 'danger') {
+      bg = Colors.red.shade700;
+      ic = Icons.warning_amber;
+      text = 'NGUY HIỂM - P=${power ?? '--'} W';
+    } else if (s == 'alert') {
+      bg = Colors.orange.shade700;
+      ic = Icons.warning_amber;
+      text = 'CẢNH BÁO - P=${power ?? '--'} W';
+    } else {
+      bg = Colors.green.shade600;
+      ic = Icons.check_circle;
+      text = 'Bình thường';
+    }
+    return Card(
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(children: [
+          Icon(ic, color: Colors.white),
+          const SizedBox(width: 8),
+          Text(text, style: const TextStyle(color: Colors.white))
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildConnectionStatus(AppState app) {
+    return StreamBuilder(
+      stream: FirebaseDatabase.instance.ref('.info/connected').onValue,
+      builder: (context, snapshot) {
+        bool connected = false;
+        if (snapshot.hasData && snapshot.data!.snapshot.value != null) {
+          connected = snapshot.data!.snapshot.value as bool;
+        }
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          color: connected ? Colors.green.withOpacity(0.1) : Colors.red.withOpacity(0.1),
+          child: Row(
+            children: [
+              Icon(connected ? Icons.cloud_done : Icons.cloud_off,
+                  color: connected ? Colors.green : Colors.red, size: 20),
+              const SizedBox(width: 8),
+              Text(connected ? "Đã kết nối Firebase" : "Mất kết nối",
+                  style: TextStyle(
+                      color: connected ? Colors.green.shade700 : Colors.red.shade700,
+                      fontWeight: FontWeight.bold)),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.refresh, size: 20),
+                onPressed: () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Đang làm mới dữ liệu...'), duration: Duration(seconds: 1)),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+
+
+class PowerChartTab extends StatefulWidget {
+  const PowerChartTab({super.key});
+
+  @override
+  State<PowerChartTab> createState() => _PowerChartTabState();
+}
+
+class _PowerChartTabState extends State<PowerChartTab> {
+  final List<FlSpot> points = [];
+  int maxPoints = 50;
+
+  double? _lastFilteredPw;
+  static const double alpha = 0.3; // hệ số EMA
+
+  double? _startTimestamp; // mốc thời gian bắt đầu
+
+  @override
+  Widget build(BuildContext context) {
+    final app = context.watch<AppState>();
+
+    return Column(
+      children: [
+        const Padding(
+          padding: EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Icon(Icons.show_chart),
+              SizedBox(width: 8),
+              Text('Đồ thị công suất theo thời gian thực',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ],
+          ),
+        ),
+        Expanded(
+          child: StreamBuilder(
+            stream: app.sensorsRef.onValue,
+            builder: (context, snapshot) {
+              if (!snapshot.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final data = (snapshot.data as DatabaseEvent).snapshot.value as Map?;
+              if (data == null) {
+                return const Center(child: Text('Chưa có dữ liệu'));
+              }
+
+              // Giá trị công suất hiện tại
+              final double pwRaw = (data['power'] ?? data['powerW'] ?? 0).toDouble();
+
+              // Làm mượt bằng EMA
+              final double filteredPw = (_lastFilteredPw == null)
+                  ? pwRaw
+                  : (alpha * pwRaw) + ((1 - alpha) * _lastFilteredPw!);
+              _lastFilteredPw = filteredPw;
+
+              // Dùng timestamp tương đối (giây từ lúc bắt đầu)
+              final now = DateTime.now().millisecondsSinceEpoch.toDouble();
+              _startTimestamp ??= now;
+              final double x = (now - _startTimestamp!) / 1000.0; // giây
+              points.add(FlSpot(x, filteredPw));
+
+              // Giữ tối đa số điểm
+              if (points.length > maxPoints) {
+                points.removeAt(0);
+              }
+
+              // Tính maxY có đệm
+              final double maxY = (points.isNotEmpty
+                      ? points.map((e) => e.y).reduce((a, b) => a > b ? a : b)
+                      : 10) *
+                  1.2;
+
+              // Format nhãn trục X từ timestamp
+              String formatLabelForX(double value) {
+                final dt = DateTime.fromMillisecondsSinceEpoch(
+                    _startTimestamp!.toInt() + (value * 1000).toInt());
+                return "${dt.hour}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}";
+              }
+
+              return Column(
+                children: [
+                  Expanded(
+                    child: LineChart(
+                      LineChartData(
+                        minY: 0,
+                        maxY: maxY > 0 ? maxY : 10,
+                        titlesData: FlTitlesData(
+                          leftTitles: AxisTitles(
+                            sideTitles: SideTitles(
+                              showTitles: true,
+                              reservedSize: 50,
+                              getTitlesWidget: (value, meta) =>
+                                  Text('${value.toInt()} W',
+                                      style: const TextStyle(fontSize: 10)),
+                            ),
+                          ),
+                          rightTitles: AxisTitles(
+                            sideTitles: SideTitles(
+                              showTitles: true,
+                              reservedSize: 40,
+                              getTitlesWidget: (value, meta) =>
+                                  Text('${value.toInt()} W',
+                                      style: const TextStyle(fontSize: 10)),
+                            ),
+                          ),
+                          bottomTitles: AxisTitles(
+                            sideTitles: SideTitles(
+                              showTitles: true,
+                              reservedSize: 60,
+                              interval: (points.length > 1)
+                                  ? max((points.last.x - points.first.x) / 5, 1)
+                                  : 1,
+                              getTitlesWidget: (value, meta) => Text(
+                                formatLabelForX(value),
+                                style: const TextStyle(fontSize: 8),
+                              ),
+                            ),
+                          ),
+                          topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false),
+                          ),
+                        ),
+                        gridData: FlGridData(
+                          show: true,
+                          drawVerticalLine: false,
+                          horizontalInterval: maxY > 0 ? (maxY / 4) : 2,
+                          getDrawingHorizontalLine: (value) => FlLine(
+                            color: Colors.grey.withOpacity(0.2),
+                            strokeWidth: 1,
+                          ),
+                        ),
+                        lineBarsData: [
+                          LineChartBarData(
+                            spots: points,
+                            isCurved: true,
+                            color: Colors.teal,
+                            barWidth: 3,
+                            isStrokeCapRound: true,
+                            dotData: FlDotData(show: false),
+                            belowBarData: BarAreaData(show: false),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Trục X: Thời gian (giờ:phút:giây)',
+                            style: TextStyle(fontSize: 12)),
+                        Text('Trục Y: Công suất (W)',
+                            style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+
+
+
+class HistoryTab extends StatefulWidget {
+  @override
+  _HistoryTabState createState() => _HistoryTabState();
+}
+
+class _HistoryTabState extends State<HistoryTab> {
+  // CHỈ GIỮ LẠI BIẾN CHỌN NGÀY
+  DateTime selectedDate = DateTime.now();
+
+  @override
+  Widget build(BuildContext context) {
+    final app = Provider.of<AppState>(context);
+    // Định dạng ngày để gửi lên Firebase
+    String dateStr = DateFormat('dd-MM-yyyy').format(selectedDate);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Lịch sử tiêu thụ"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.calendar_month),
+            onPressed: () async {
+              final picked = await showDatePicker(
+                context: context,
+                initialDate: selectedDate,
+                firstDate: DateTime(2024),
+                lastDate: DateTime.now(),
+              );
+              if (picked != null) {
+                setState(() => selectedDate = picked);
+              }
+            },
+          )
+        ],
+      ),
+      body: StreamBuilder<DatabaseEvent>(
+  stream: app.getHistoryStream(dateStr),
+  builder: (context, snapshot) {
+    // CẢI TIẾN: Nếu đang có dữ liệu (hasData), dù là đang cập nhật cũng không hiện màn hình chờ
+    if (!snapshot.hasData) {
+      if (snapshot.connectionState == ConnectionState.waiting) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      return const Center(child: Text("Không có dữ liệu cho ngày này"));
+    }
+
+    // Nếu lỡ snapshot trả về null (sau khi đã kiểm tra hasData)
+    if (snapshot.data!.snapshot.value == null) {
+      return const Center(child: Text("Không có dữ liệu cho ngày này"));
+    }
+
+    Map<dynamic, dynamic> dayData = Map<dynamic, dynamic>.from(snapshot.data!.snapshot.value as Map);
+    Map<dynamic, dynamic> timeline = Map<dynamic, dynamic>.from(dayData['timeline'] ?? {});
+    var sortedKeys = timeline.keys.toList()..sort((a, b) => b.compareTo(a));
+
+    return Column(
+      children: [
+        // Tổng tiêu thụ (Vẫn hiện ở trên)
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(16),
+          color: Colors.blue.shade50,
+          child: Text(
+            "Tổng tiêu thụ: ${dayData['daily_total_kwh'] ?? '0.0'} kWh",
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            textAlign: TextAlign.center,
+          ),
+        ),
+        
+        Expanded(
+          child: ListView.builder(
+            // CẢI TIẾN: Thêm Key để ListView không bị làm mới hoàn toàn
+            key: const PageStorageKey('history_list'), 
+            itemCount: sortedKeys.length,
+            itemBuilder: (context, index) {
+              if (index >= sortedKeys.length) return const SizedBox();
+              String time = sortedKeys[index];
+              var val = timeline[time];
+
+              String fullDate = dateStr;
+
+              if (val == null) return const SizedBox();
+              
+              // CẢI TIẾN: Dùng Widget có tính ổn định cao
+              return Card(
+                key: ValueKey(time), // Định danh cho từng dòng để Flutter cập nhật mượt hơn
+                margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                child: ListTile(
+                  leading: const Icon(Icons.access_time, color: Colors.blue),
+                  title: Text("Lúc: $time"),
+                  
+                  subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                  const SizedBox(height: 4),
+                  Text("Ngày: $fullDate  |  P: ${val['power_w'] ?? 0} W", 
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                  ],
+                ),
+                  trailing: Text(
+                     "${(val['energy_kwh'] ?? 0.0).  toStringAsFixed(3)} kWh",
+                      style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  },
+),
+    );
+  }
+}
+
+
+class BillingTab extends StatefulWidget {
+  @override
+  _BillingTabState createState() => _BillingTabState();
+}
+
+class _BillingTabState extends State<BillingTab> {
+  DateTime selectedDate = DateTime.now();
+  bool isMonthView = false; // Toggle giữa chọn Ngày và chọn Tháng
+  bool isManualPrice = false; // Bật để tự nhập giá, tắt để dùng 6 bậc EVN
+  final priceCtrl = TextEditingController(text: "2500"); // Giá mặc định khi tự nhập
+
+  // Hàm tính toán tiền điện theo 6 bậc thang Việt Nam
+  double calculateEVN(double usage) {
+  if (usage <= 0) return 0;
+  double bill = 0;
+  
+  // Bảng giá mới theo ảnh bạn cung cấp
+  double b1 = 1984; // 0-50
+  double b2 = 2050; // 51-100
+  double b3 = 2380; // 101-200
+  double b4 = 2998; // 201-300
+  double b5 = 3350; // 301-400
+  double b6 = 3460; // Trên 400
+
+  if (usage <= 50) {
+    bill = usage * b1;
+  } else if (usage <= 100) {
+    bill = (50 * b1) + ((usage - 50) * b2);
+  } else if (usage <= 200) {
+    bill = (50 * b1) + (50 * b2) + ((usage - 100) * b3);
+  } else if (usage <= 300) {
+    bill = (50 * b1) + (50 * b2) + (100 * b3) + ((usage - 200) * b4);
+  } else if (usage <= 400) {
+    bill = (50 * b1) + (50 * b2) + (100 * b3) + (100 * b4) + ((usage - 300) * b5);
+  } else {
+    bill = (50 * b1) + (50 * b2) + (100 * b3) + (100 * b4) + (100 * b5) + ((usage - 400) * b6);
+  }
+  
+  return bill;
+}
+
+  // Hàm tra cứu đơn giá đúng theo bảng giá bạn gửi
+double getEVNUnitPrice(double usage) {
+  if (usage <= 50) return 1984;
+  if (usage <= 100) return 2050;
+  if (usage <= 200) return 2380;
+  if (usage <= 300) return 2998;
+  if (usage <= 400) return 3350;
+  return 3460; // Bậc 6
+}
+
+  // Hàm hiển thị kết quả tính tiền
+void showResult(double kwh, double totalMoney) {
+    // Khởi tạo service để chụp ảnh hóa đơn
+    final BillExportService _billService = BillExportService();
+    
+    // Chuẩn bị chuỗi thời gian để in lên hóa đơn
+    String dateInfo = isMonthView 
+        ? "Tháng " + DateFormat('MM/yyyy').format(selectedDate) 
+        : DateFormat('dd/MM/yyyy').format(selectedDate);
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Kết quả tính tiền"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("Thời gian: $dateInfo"),
+            const SizedBox(height: 8),
+            Text("Tổng điện năng: ${kwh.toStringAsFixed(3)} kWh"),
+            const SizedBox(height: 8),
+            Text("Thành tiền: ${NumberFormat("#,###").format(totalMoney)} VNĐ", 
+                 style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Colors.red)),
+            
+            const Divider(height: 30), // Vạch kẻ ngăn cách
+            
+            // --- NÚT BẤM THÊM MỚI TẠI ĐÂY ---
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () async {      
+                  Navigator.pop(context);
+                  await _billService.captureAndShareBill(context, kwh, dateInfo);
+                },
+                icon: const Icon(Icons.share),
+                label: const Text("Xuất & Gửi qua Zalo"),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green, 
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            SizedBox(
+  width: double.infinity,
+  child: ElevatedButton.icon(
+    onPressed: () async {
+      Navigator.pop(context);
+      await Future.delayed(const Duration(milliseconds: 100));
+      await _billService.saveBillToGallery(context, kwh, dateInfo);
+    },
+    icon: const Icon(Icons.download),
+    label: const Text("Xuất & Tải hình ảnh xuống"),
+    style: ElevatedButton.styleFrom(backgroundColor: Colors.orange, foregroundColor: Colors.white),
+  ),
+),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context), 
+            child: const Text("Đóng")
+          ),
+        ],
+      ),
+    );
+  }
+
+ @override
+  Widget build(BuildContext context) {
+    final app = context.watch<AppState>();
+    double totalKwh = app.calculateUsage(selectedDate, isMonthView);
+
+    // --- LOGIC MỚI: TỰ ĐỘNG CẬP NHẬT Ô ĐƠN GIÁ KHI TẮT SWITCH ---
+    if (!isManualPrice) {
+      double unitPrice = getEVNUnitPrice(totalKwh);
+      // Cập nhật text controller sau khi frame hiện tại build xong để tránh lỗi
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!isManualPrice) {
+          priceCtrl.text = unitPrice.toStringAsFixed(0);
+        }
+      });
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          // 1. CHỌN THỜI GIAN
+          Card(
+            elevation: 3,
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.calendar_month, color: Colors.blue),
+                  title: Text(isMonthView ? "Xem theo Tháng" : "Xem theo Ngày"),
+                  subtitle: Text(isMonthView 
+                    ? DateFormat('MM/yyyy').format(selectedDate) 
+                    : DateFormat('dd/MM/yyyy').format(selectedDate)),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.edit_calendar),
+                    onPressed: () async {
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: selectedDate,
+                        firstDate: DateTime(2023),
+                        lastDate: DateTime.now(),
+                      );
+                      if (picked != null) setState(() => selectedDate = picked);
+                    },
+                  ),
+                ),
+                SwitchListTile(
+                  title: const Text("Chế độ chọn cả tháng"),
+                  value: isMonthView,
+                  onChanged: (val) => setState(() => isMonthView = val),
+                ),
+              ],
+            ),
+          ),
+
+          // HIỂN THỊ ĐIỆN NĂNG
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.teal.shade50,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.teal.shade200),
+            ),
+            child: Column(
+              children: [
+                Text(
+                  isMonthView ? "Tổng điện năng trong tháng" : "Điện năng tiêu thụ trong ngày",
+                  style: TextStyle(color: Colors.teal.shade700, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "${totalKwh.toStringAsFixed(3)} kWh",
+                  style: const TextStyle(
+                    fontSize: 32, 
+                    fontWeight: FontWeight.bold, 
+                    color: Colors.teal
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          // 2. NHẬP ĐƠN GIÁ & SWITCH (ĐÃ CẬP NHẬT LOGIC NHẢY SỐ)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text("Bảng đơn giá", style: TextStyle(fontWeight: FontWeight.bold)),
+                      Switch(
+                        value: isManualPrice,
+                        onChanged: (val) => setState(() => isManualPrice = val),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: priceCtrl,
+                    enabled: isManualPrice, 
+                    keyboardType: TextInputType.number,
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: isManualPrice ? Colors.black : Colors.blue.shade700,
+                    ),
+                    decoration: InputDecoration(
+                      labelText: isManualPrice ? "Đơn giá (VNĐ/kWh)" : "Đơn giá theo bậc tiêu thụ (Tự động)",
+                      border: const OutlineInputBorder(),
+                      filled: !isManualPrice,
+                      fillColor: Colors.grey.shade200,
+                      suffixText: "đ/kWh",
+                      // Hiển thị thêm ghi chú bậc hiện tại cho người dùng dễ hiểu
+                      helperText: !isManualPrice 
+                          ? "Đang áp dụng đơn giá Bậc ${totalKwh <= 50 ? '1' : totalKwh <= 100 ? '2' : totalKwh <= 200 ? '3' : totalKwh <= 300 ? '4' : totalKwh <= 400 ? '5' : '6'}"
+                          : "Nhập giá cố định bạn muốn tính",
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 30),
+
+          // 3. NÚT TÍNH TIỀN
+          SizedBox(
+            width: double.infinity,
+            height: 55,
+            child: ElevatedButton.icon(
+              onPressed: () {
+                double resultMoney = 0;
+                if (isManualPrice) {
+                  double manualPrice = double.tryParse(priceCtrl.text) ?? 0;
+                  resultMoney = totalKwh * manualPrice;
+                } else {
+                  resultMoney = calculateEVN(totalKwh);
+                }
+                showResult(totalKwh, resultMoney);
+              },
+              icon: const Icon(Icons.calculate, color: Colors.white),
+              label: const Text("TÍNH TIỀN ĐIỆN", style: TextStyle(fontSize: 18, color: Colors.white)),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange.shade700),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+class SettingsTab extends StatefulWidget {
+  const SettingsTab({super.key});
+  @override
+  State<SettingsTab> createState() => _SettingsTabState();
+}
+
+class _SettingsTabState extends State<SettingsTab> {
+  final pinCtrl = TextEditingController();
+  final oldPinCtrl = TextEditingController();
+
+  final oldResetPinCtrl = TextEditingController();
+  final resetPinCtrl = TextEditingController();
+
+  // --- THÊM MỚI: Controller cho WiFi ---
+  final ssidCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
+
+  @override
+  Widget build(BuildContext context) {
+    final app = context.watch<AppState>();
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          // --- KHỐI ĐỔI MẬT MÃ APP (Giữ nguyên) ---
+          Card(
+            elevation: 2,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Đổi mật mã chế độ cảnh báo",
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: oldPinCtrl,
+                    keyboardType: TextInputType.number,
+                    maxLength: 5,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: "Nhập mật mã CŨ",
+                      hintText: "*****",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: pinCtrl,
+                    keyboardType: TextInputType.number,
+                    maxLength: 5,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: "Nhập mật mã MỚI",
+                      hintText: "*****",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: () {
+                        if (oldPinCtrl.text != app.appPin) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Mật mã CŨ không chính xác!"),
+                                backgroundColor: Colors.red),
+                          );
+                          return;
+                        }
+                        if (pinCtrl.text.length == 5) {
+                          app.updateAppPin(pinCtrl.text);
+                          pinCtrl.clear();
+                          oldPinCtrl.clear();
+                          FocusScope.of(context).unfocus();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Đã cập nhật mật mã mới thành công!")),
+                          );
+                        } else {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Mật mã mới phải đủ 5 chữ số!"),
+                                backgroundColor: Colors.orange),
+                          );
+                        }
+                      },
+                      child: const Text("XÁC NHẬN ĐỔI MÃ"),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          // --- KHỐI ĐỔI MẬT MÃ RESET (Giữ nguyên) ---
+          Card(
+            elevation: 2,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Đổi mật mã Reset Điện năng",
+                      style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16)),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: oldResetPinCtrl,
+                    obscureText: true,
+                    maxLength: 5,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                        labelText: "Nhập mật mã CŨ",
+                        hintText: "*****",
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: resetPinCtrl,
+                    obscureText: true,
+                    maxLength: 5,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                        labelText: "Nhập mật mã MỚI",
+                        hintText: "*****",
+                        border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent),
+                      onPressed: () {
+                        if (oldResetPinCtrl.text != app.resetPin) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Mật mã Reset CŨ không chính xác!"),
+                                backgroundColor: Colors.red),
+                          );
+                          return;
+                        }
+
+                        if (resetPinCtrl.text.length == 5) {
+                          app.updateResetPin(resetPinCtrl.text);
+                          resetPinCtrl.clear();
+                          oldResetPinCtrl.clear();
+                          FocusScope.of(context).unfocus();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Đã cập nhật mật mã Reset mới!")),
+                          );
+                        } else {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Mật mã mới phải đủ 5 chữ số!"),
+                                backgroundColor: Colors.orange),
+                          );
+                        }
+                      },
+                      child: const Text("XÁC NHẬN ĐỔI MÃ"),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+
+          const SizedBox(height: 20),
+
+          // --- KHỐI HƯỚNG DẪN CẤU HÌNH WIFI (Giữ nguyên) ---
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.blue.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.blue.shade200),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.wifi, color: Colors.blue.shade700),
+                    const SizedBox(width: 8),
+                    Text(
+                      "Hướng dẫn cấu hình WiFi",
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                        color: Colors.blue.shade800,
+                      ),
+                    ),
+                  ],
+                ),
+                                const SizedBox(height: 12),
+                _buildStep("1",
+                    "Nếu thiết bị mất mạng, hãy tìm WiFi tên: 'ESP32_Tudien_Setup'"),
+                _buildStep("2", "Mật khẩu kết nối là: '12345678'"),
+                _buildStep("3",
+                    "Nếu trang web không tự hiện, hãy truy cập: 192.168.4.1 trên trình duyệt."),
+                _buildStep("4",
+                    "Chọn 'Configure WiFi' và nhập thông tin mạng mới cho ESP32."),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Hàm phụ tạo các dòng hướng dẫn từng bước
+  Widget _buildStep(String number, String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          CircleAvatar(
+            radius: 10,
+            backgroundColor: Colors.blue.shade700,
+            child: Text(
+              number,
+              style: const TextStyle(
+                  fontSize: 11,
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(fontSize: 14, color: Colors.black87),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+class BillExportService {
+  final ScreenshotController screenshotController = ScreenshotController();
+
+  Map<String, double> getDetailedBill(double totalKwh) {
+    double b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+    if (totalKwh <= 50) { b1 = totalKwh; } 
+    else if (totalKwh <= 100) { b1 = 50; b2 = totalKwh - 50; } 
+    else if (totalKwh <= 200) { b1 = 50; b2 = 50; b3 = totalKwh - 100; } 
+    else if (totalKwh <= 300) { b1 = 50; b2 = 50; b3 = 100; b4 = totalKwh - 200; } 
+    else if (totalKwh <= 400) { b1 = 50; b2 = 50; b3 = 100; b4 = 100; b5 = totalKwh - 300; } 
+    else { b1 = 50; b2 = 50; b3 = 100; b4 = 100; b5 = 100; b6 = totalKwh - 400; }
+
+    double rawTotal = (b1 * 1984) + (b2 * 2050) + (b3 * 2380) + (b4 * 2998) + (b5 * 3350) + (b6 * 3460);
+    return {
+      'b1': b1, 'b2': b2, 'b3': b3, 'b4': b4, 'b5': b5, 'b6': b6,
+      'total': rawTotal, 'vat': rawTotal * 0.1, 'final': rawTotal * 1.1
+    };
+  }
+
+  Future<void> captureAndShareBill(BuildContext context, double kwh, String dateInfo) async {
+    try {
+
+  final bill = getDetailedBill(kwh);
+  String exportTime = DateFormat('HH:mm:ss dd/MM/yyyy').format(DateTime.now());
+  
+  // Tạo giao diện hoàn chỉnh bên trong biến này
+  Widget billWidget = Material( // Thêm Material để tránh lỗi font chữ không hiển thị
+    color: Colors.white,
+    child: Container(
+      padding: EdgeInsets.all(20),
+      width: 400,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(child: Text("HÓA ĐƠN TIỀN ĐIỆN", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.blue))),
+          SizedBox(height: 10),
+          Text("Thời gian: $dateInfo", style: TextStyle(color: Colors.black, fontSize: 14)),
+          Text("Ngày xuất: ${DateFormat('HH:mm:ss dd/MM/yyyy').format(DateTime.now())}", 
+          style: const TextStyle(color: Colors.black)),
+          Text("Tổng tiêu thụ: ${kwh.toStringAsFixed(2)} kWh", style: TextStyle(color: Colors.black, fontSize: 14)),
+          Divider(thickness: 2, color: Colors.grey),
+          _row("Bậc 1 (0-50)", bill['b1']!, 1984),
+          _row("Bậc 2 (51-100)", bill['b2']!, 2050),
+          _row("Bậc 3 (101-200)", bill['b3']!, 2380),
+          _row("Bậc 4 (201-300)", bill['b4']!, 2998),
+          _row("Bậc 5 (301-400)", bill['b5']!, 3350),
+          _row("Bậc 6 (>400)", bill['b6']!, 3460),
+          Divider(color: Colors.grey),
+          _sum("Tiền điện:", bill['total']!),
+          _sum("Thuế GTGT (10%):", bill['vat']!),
+          _sum("TỔNG CỘNG:", bill['final']!, isBold: true),
+          SizedBox(height: 10),
+          Center(child: Text("Cảm ơn bạn!", style: TextStyle(fontStyle: FontStyle.italic, color: Colors.grey))),
+        ],
+      ),
+    ),
+  );
+
+  // CHỈNH SỬA QUAN TRỌNG: Thêm delay để tránh mất chữ
+  final Uint8List? imageBytes = await screenshotController.captureFromWidget(
+    billWidget,
+    delay: Duration(milliseconds: 300), // Đợi 0.2 giây để render đủ chữ
+    pixelRatio: 2.0, // Tăng độ nét cho ảnh
+  );
+
+  if (imageBytes != null) {
+    final directory = await getTemporaryDirectory();
+    final imagePath = await File('${directory.path}/hoadon.png').create();
+    await imagePath.writeAsBytes(imageBytes);
+    await Share.shareXFiles([XFile(imagePath.path)], text: 'Hóa đơn tiền điện $dateInfo');
+  }
+}  catch (e) {
+  debugPrint("Lỗi khi chia sẻ: $e");
+    // Nếu lỗi, hiện thông báo nhỏ để người dùng biết
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Có lỗi xảy ra khi chia sẻ!")),
+      );
+    }
+  }
+}
+
+  Widget _row(String label, double kwh, int price) {
+    if (kwh <= 0) return SizedBox.shrink();
+    return Padding(padding: EdgeInsets.symmetric(vertical: 2), 
+      child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(label), Text("${kwh.toStringAsFixed(2)} x $price")]));
+  }
+
+  Widget _sum(String label, double amount, {bool isBold = false}) {
+    return Padding(padding: EdgeInsets.symmetric(vertical: 4), 
+      child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        Text(label, style: TextStyle(fontWeight: isBold ? FontWeight.bold : FontWeight.normal)),
+        Text("${amount.toStringAsFixed(0)} đ", style: TextStyle(fontWeight: isBold ? FontWeight.bold : FontWeight.normal, color: isBold ? Colors.red : Colors.black)),
+      ]));
+  }
+
+  Future<void> saveBillToGallery(BuildContext context, double kwh, String dateInfo) async {
+  try {
+    final bill = getDetailedBill(kwh);
+    
+    // 1. Tạo giao diện hóa đơn để chụp
+    Widget billWidget = Material(
+      color: Colors.white,
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        width: 400,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Center(
+              child: Text("HÓA ĐƠN TIỀN ĐIỆN", 
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.blue))
+            ),
+            const SizedBox(height: 10),
+            Text("Thời gian: $dateInfo", style: const TextStyle(color: Colors.black)),
+            Text("Ngày xuất: ${DateFormat('HH:mm:ss dd/MM/yyyy').format(DateTime.now())}", 
+            style: const TextStyle(color: Colors.black)),
+            Text("Tổng tiêu thụ: ${kwh.toStringAsFixed(2)} kWh", style: const TextStyle(color: Colors.black)),
+            const Divider(thickness: 2, color: Colors.grey),
+            
+            // Các dòng chi tiết bậc điện (sử dụng hàm _row của bạn)
+            _row("Bậc 1 (0-50)", bill['b1']!, 1984),
+            _row("Bậc 2 (51-100)", bill['b2']!, 2050),
+            _row("Bậc 3 (101-200)", bill['b3']!, 2380),
+            _row("Bậc 4 (201-300)", bill['b4']!, 2998),
+            _row("Bậc 5 (301-400)", bill['b5']!, 3350),
+            _row("Bậc 6 (>400)", bill['b6']!, 3460),
+            
+            const Divider(color: Colors.grey),
+            _sum("Tiền điện:", bill['total']!),
+            _sum("Thuế GTGT (10%):", bill['vat']!),
+            _sum("TỔNG CỘNG:", bill['final']!, isBold: true),
+            const SizedBox(height: 10),
+            const Center(
+              child: Text("Cảm ơn bạn!", 
+                style: TextStyle(fontStyle: FontStyle.italic, color: Colors.grey))
+            ),
+          ],
+        ),
+      ),
+    );
+
+    // 2. Chụp ảnh từ Widget
+    final Uint8List? imageBytes = await screenshotController.captureFromWidget(
+      billWidget,
+      delay: const Duration(milliseconds: 300), // Đợi render để không mất chữ
+      pixelRatio: 2.0, // Tăng độ nét
+    );
+
+    if (imageBytes != null) {
+      // 3. Lưu thành file tạm trước khi đẩy vào Gallery
+      final directory = await getTemporaryDirectory();
+      String fileName = 'HoaDon_${DateTime.now().millisecondsSinceEpoch}.png';
+      final imagePath = '${directory.path}/$fileName';
+      final imageFile = File(imagePath);
+      await imageFile.writeAsBytes(imageBytes);
+
+      // 4. Dùng thư viện GAL để lưu vào Album ảnh
+      await Gal.putImage(imagePath);
+
+      // 5. Thông báo thành công
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.white),
+                SizedBox(width: 10),
+                Text("Đã tải hóa đơn xuống thư viện ảnh!"),
+              ],
+            ),
+            backgroundColor: Colors.green.shade700,
+            duration: const Duration(seconds: 2), // Thông báo hiện trong 2 giây
+            behavior: SnackBarBehavior.floating, // Hiển thị dạng nổi cho đẹp
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        );
+      }
+    }
+  } catch (e) {
+    debugPrint("Lỗi khi lưu ảnh: $e");
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("❌ Không thể lưu ảnh. Vui lòng kiểm tra quyền truy cập!"),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+}
+
+}
