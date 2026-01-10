@@ -1,0 +1,722 @@
+// ====== ESP32 full code ======
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Preferences.h>
+#include <PZEM004Tv30.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <ArduinoJson.h>
+#include <WiFiManager.h>
+
+// ---- WiFi & Firebase ----
+//#define DEFAULT_WIFI_SSID  "NTT"
+//#define DEFAULT_WIFI_PASS "13572468"
+
+//String current_ssid, current_pass;
+
+#define API_KEY        "AIzaSyA2_y1w-Aoevmppd6tQvCd_Qn7w19RCoDo"
+#define DATABASE_URL   "https://dodien-751c3-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// ---- Firebase client objects ----
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long sendDataPrevMillis = 0; 
+bool signupOK = false;
+double resetOffsetKwh = 0.0;
+
+// ---- OLED ----
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+const unsigned char icon_bolt[] PROGMEM = {
+  0x04, 0x00,
+  0x0E, 0x00,
+  0x1F, 0x00,
+  0x3F, 0x80,
+  0x7F, 0xC0,
+  0x3F, 0x80,
+  0x1F, 0x00,
+  0x0E, 0x00,
+  0x04, 0x00,
+  0x0C, 0x00,
+  0x1E, 0x00,
+  0x3F, 0x00,
+  0x7F, 0x80,
+  0x3F, 0x00,
+  0x1E, 0x00,
+  0x0C, 0x00
+};
+
+// ---- DHT22 ----
+#define DHTPIN  4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---- PZEM-004T v3.0 ----
+// Sử dụng Serial2 với GPIO: RX2=16, TX2=17 (tùy board)
+PZEM004Tv30 pzem(Serial2, 16, 17);
+
+// ---- I/O ----
+#define LED_GREEN   2
+#define LED_RED     15
+#define BUZZER_PIN  13
+
+#define RELAY1_PIN  26
+#define RELAY2_PIN  27
+
+#define BTN1_PIN    33  // Toggle relay1 (HIGH active)
+#define BTN2_PIN    32  // Toggle relay2 (HIGH active)
+#define BTN3_PIN    25  // Hold to enter/exit settings mode
+//#define BTN4_PIN    14  // Increase threshold
+//#define BTN5_PIN    12  // Decrease threshold
+#define BTN6_PIN    5
+
+// ---- State ----
+Preferences prefs;
+
+
+
+
+bool relay1 = false;
+bool relay2 = false;
+
+bool alertEnabled = true;
+double alertThresholdW = 1000.0;   // mức 1
+double dangerThresholdW = 2000.0;  // mức 2
+
+String alertState = "normal"; // "normal" | "alert" | "danger"
+
+bool settingsMode = false;         // chế độ cài đặt ngưỡng
+bool editingDanger = false;        // false->edit alert, true->edit danger
+
+unsigned long btn6Start = 0;
+
+
+// Display switching
+unsigned long lastScreenSwitch = 0;
+int screenIndex = 0; // 0: thông số điện, 1: nhiệt/độ ẩm
+
+// Timing
+unsigned long lastUpdateMs = 0;
+const unsigned long updateIntervalMs = 2000; // đọc + cập nhật Firebase
+unsigned long lastBuzzerToggle = 0;
+
+// History & daily close
+unsigned long lastMinuteWriteMs = 0;
+int lastDay = -1;
+double dailyEnergyStartKwh = 0.0; // dùng để tính daily total (snapshot khi qua ngày)
+String lastSavedDate = ""; // Thêm dòng này để theo dõi ngày
+
+// Readings
+double voltage=0, currentA=0, powerW=0, energyKwh=0, frequencyHz=0, pf=0;
+double tempC=0, humPct=0;
+
+// Debounce & long press
+unsigned long btn3PressStart = 0;
+bool btn3Held = false;
+
+void savePrefs() {
+  prefs.begin("cfg", false);
+  prefs.putBool("relay1", relay1);
+  prefs.putBool("relay2", relay2);
+  prefs.putBool("alertEnabled", alertEnabled);
+  prefs.putDouble("alertThresholdW", alertThresholdW);
+  prefs.putDouble("dangerThresholdW", dangerThresholdW);
+  prefs.putDouble("dailyEnergyStartKwh", dailyEnergyStartKwh);
+  prefs.putString("lastDate", lastSavedDate);
+  prefs.putDouble("resetOffsetKwh", resetOffsetKwh);
+  prefs.end();
+}
+
+void loadPrefs() {
+  prefs.begin("cfg", true);
+  relay1 = prefs.getBool("relay1", false);
+  relay2 = prefs.getBool("relay2", false);
+  alertEnabled = prefs.getBool("alertEnabled", true);
+  alertThresholdW = prefs.getDouble("alertThresholdW", 1000.0);
+  dangerThresholdW = prefs.getDouble("dangerThresholdW", 2000.0);
+  dailyEnergyStartKwh = prefs.getDouble("dailyEnergyStartKwh", 0.0);
+  lastSavedDate = prefs.getString("lastDate", "");
+  resetOffsetKwh = prefs.getDouble("resetOffsetKwh", 0.0);
+  prefs.end();
+}
+
+void applyRelayOutputs() {
+  digitalWrite(RELAY1_PIN, relay1 ? HIGH : LOW);
+  digitalWrite(RELAY2_PIN, relay2 ? HIGH : LOW);
+}
+
+
+
+void connectWiFi() {
+    WiFiManager wm;
+
+    // 1. THÊM VÀO ĐÂY: Thời gian thử kết nối với WiFi cũ (giây)
+    // ESP32 sẽ kiên nhẫn đợi Router khởi động hoặc tìm mạng cũ trong 60s
+    wm.setConnectTimeout(20);
+
+    // 1. Cấu hình thời gian chờ
+    // Nếu sau 180 giây không có ai kết nối vào WiFi phát ra để cấu hình, 
+    // hàm autoConnect sẽ trả về 'false'.
+    wm.setConfigPortalTimeout(0); 
+
+    // 2. Tên WiFi và Mật khẩu mà ESP32 sẽ phát ra
+    // Bạn dùng điện thoại kết nối vào WiFi này để nhập thông tin mạng mới.
+    // Tên WiFi: ESP32_Tudien_Setup | Mật khẩu: 12345678
+    if (!wm.autoConnect("ESP32_Tudien_Setup", "12345678")) {
+        Serial.println("Quá thời gian chờ cấu hình WiFi (180s)!");
+        Serial.println("Đang khởi động lại ESP32 để thử lại...");
+        
+        delay(3000);
+        ESP.restart(); // LỆNH QUAN TRỌNG: Khởi động lại máy
+    }
+
+    // Nếu chạy đến đây nghĩa là đã kết nối thành công
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+
+
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    signupOK = true;
+    Serial.println("✅ Firebase connected!");
+  } else {
+    Serial.printf("❌ Firebase error: %s\n", config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600); // PZEM-004T v3.0 default baud
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
+  pinMode(BTN3_PIN, INPUT_PULLUP);
+  pinMode(BTN4_PIN, INPUT_PULLUP);
+  pinMode(BTN5_PIN, INPUT_PULLUP);
+
+  loadPrefs();
+  applyRelayOutputs();
+
+  dht.begin();
+
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // OLED init failed
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  connectWiFi();
+  initFirebase();
+
+  digitalWrite(LED_GREEN, HIGH); // bình thường
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  
+
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Múi giờ Việt Nam +7
+}
+
+String getFormattedDate() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00-00-0000";
+  char buffer[11];
+  // Định dạng: DD-MM-YYYY (Ví dụ: 20-05-2024)
+  strftime(buffer, sizeof(buffer), "%d-%m-%Y", &timeinfo);
+  return String(buffer);
+}
+
+String getFormattedTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "00:00:00";
+  char buffer[9];
+  // Định dạng: HH:MM:SS
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+
+// ---- Thêm biến thời gian riêng cho control ----
+unsigned long lastControlCheckMs = 0;
+const unsigned long controlIntervalMs = 500;   // kiểm tra lệnh điều khiển mỗi 0.5s
+
+void loop() {
+  handleButtons();
+  readSensors();
+  evaluateAlertState();
+  handleOutputs();
+  updateDisplay();
+
+  // --- Gửi dữ liệu cảm biến & ghi lịch sử mỗi 2s ---
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 2000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    syncFirebaseSensors();       // chỉ đẩy dữ liệu cảm biến
+    writeHistoryAndDailyClose(); // ghi lịch sử
+  }
+
+  // --- Đọc lệnh điều khiển nhanh hơn (0.5s) ---
+  if (Firebase.ready() && signupOK && (millis() - lastControlCheckMs > controlIntervalMs)) {
+    lastControlCheckMs = millis();
+    syncFirebaseControl();       // chỉ đọc lệnh điều khiển
+  }
+
+  
+
+}
+
+
+
+
+// ---- Buttons handling ----
+bool readBtn(int pin) { return digitalRead(pin) == LOW; } // active low
+
+// Hàm hiển thị thông báo tạm thời trên OLED
+void showTempMessage(String msg) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print(msg);
+  display.display();
+  delay(1500); // hiển thị 1.5 giây rồi quay lại bình thường
+}
+
+// Biến offset reset giống Flutter
+
+
+void handleButtons() {
+  
+  static bool lastB1 = HIGH, lastB2 = HIGH;
+  static uint32_t lastDebounce = 0;
+  const uint16_t debounceMs = 50; // tăng debounce lên 50ms cho chắc
+
+  bool b1 = digitalRead(BTN1_PIN); // với INPUT_PULLUP: nhấn = LOW
+  bool b2 = digitalRead(BTN2_PIN);
+  
+ 
+
+  uint32_t now = millis();
+  if (now - lastDebounce < debounceMs) return;
+  lastDebounce = now;
+
+  // BTN1 toggle relay1
+  if (b1 == LOW && lastB1 == HIGH) {
+  relay1 = !relay1;
+  applyRelayOutputs();
+  savePrefs();
+
+  // Ghi trạng thái mới lên Firebase để app thấy ngay
+  Firebase.RTDB.setBool(&fbdo, "/esp32/control/relay1", relay1);
+
+  Serial.print("Relay1: "); Serial.println(relay1 ? "ON" : "OFF");
+}
+
+if (b2 == LOW && lastB2 == HIGH) {
+  relay2 = !relay2;
+  applyRelayOutputs();
+  savePrefs();
+
+  // Ghi trạng thái mới lên Firebase để app thấy ngay
+  Firebase.RTDB.setBool(&fbdo, "/esp32/control/relay2", relay2);
+
+  Serial.print("Relay2: "); Serial.println(relay2 ? "ON" : "OFF");
+}
+
+
+  lastB1 = b1;
+  lastB2 = b2;
+
+
+
+  
+
+
+
+  
+
+  // BTN3 hold 2s -> toggle alertEnabled
+  static unsigned long btn3Start=0;
+  bool b3 = readBtn(BTN3_PIN);
+  if (b3) {
+    if (btn3Start==0) btn3Start = millis();
+    else if (millis()-btn3Start > 2000) {
+      alertEnabled = !alertEnabled;
+      savePrefs();
+      showTempMessage(alertEnabled ? "Alert ON" : "Alert OFF");
+
+      // đồng bộ với Firebase
+      Firebase.RTDB.setBool(&fbdo, "/esp32/control/alert_enabled", alertEnabled);
+
+      btn3Start=0;
+    }
+  } else btn3Start=0;
+
+  // BTN4 hold 2s -> reset energy offset
+  // BTN4 hold 2s -> reset energy offset (dựa trên daily_total_kwh)
+// BTN4 hold 2s -> reset energy offset
+static unsigned long btn4Start = 0;
+bool b4 = readBtn(BTN4_PIN);
+if (b4) {
+  if (btn4Start == 0) btn4Start = millis();
+  else if (millis() - btn4Start > 2000) {
+    resetOffsetKwh = energyKwh;   // lấy mốc hiện tại từ cảm biến
+    savePrefs();
+    showTempMessage("Reset Energy!");
+
+    // Ghi offset lên Firebase để Flutter cũng đọc được
+    Firebase.RTDB.setFloat(&fbdo, "/app/reset_offset_kwh", resetOffsetKwh);
+
+    btn4Start = 0;
+  }
+} else btn4Start = 0;
+
+// BTN6 hold 5s -> vào chế độ AP config WiFi
+bool b6 = readBtn(BTN6_PIN);
+if (b6) {
+  if (btn6Start == 0) btn6Start = millis();
+  else if (millis() - btn6Start > 5000) {
+    showTempMessage("WiFi Config...");
+
+    // Xóa WiFi cũ
+    WiFi.disconnect(true, true); // clear credentials
+
+    // Gọi lại WiFiManager để mở portal AP
+    WiFiManager wm;
+    wm.resetSettings(); // xóa cấu hình cũ
+    if (!wm.startConfigPortal("ESP32_Tudien_Setup", "12345678")) {
+      Serial.println("Config portal timeout!");
+      ESP.restart();
+    }
+
+    Serial.println("WiFi mới đã lưu!");
+    btn6Start = 0;
+  }
+} else btn6Start = 0;
+
+
+
+}
+
+
+// ---- Read sensors ----
+void readSensors() {
+  if (millis() - lastUpdateMs < updateIntervalMs) return;
+  lastUpdateMs = millis();
+
+  voltage    = pzem.voltage();
+  currentA   = pzem.current();
+  powerW     = pzem.power();
+  energyKwh  = pzem.energy();
+  frequencyHz= pzem.frequency();
+  pf         = pzem.pf();
+
+  tempC      = dht.readTemperature();
+  humPct     = dht.readHumidity();
+
+  // Basic sanity filter
+  if (isnan(voltage)) voltage = 0;
+  if (isnan(currentA)) currentA = 0;
+  if (isnan(powerW)) powerW = 0;
+  if (isnan(energyKwh)) energyKwh = 0;
+  if (isnan(frequencyHz)) frequencyHz = 0;
+  if (isnan(pf)) pf = 0;
+  if (isnan(tempC)) tempC = 0;
+  if (isnan(humPct)) humPct = 0;
+}
+
+// ---- Alert evaluation ----
+void evaluateAlertState() {
+  if (!alertEnabled) {
+    alertState = "normal";
+    return;
+  }
+  if (powerW >= dangerThresholdW) alertState = "danger";
+  else if (powerW >= alertThresholdW) alertState = "alert";
+  else alertState = "normal";
+}
+
+// ---- Outputs: LED/Buzzer ----
+void handleOutputs() {
+  if (alertState == "normal") {
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+  } else if (alertState == "alert") {
+    // red blink + buzzer 0.5s
+    digitalWrite(LED_GREEN, LOW);
+    blinkAndBuzz(600);
+  } else {
+    // danger: red blink faster + buzzer 0.25s
+    digitalWrite(LED_GREEN, LOW);
+    blinkAndBuzz(400);
+  }
+}
+
+void blinkAndBuzz(unsigned intervalMs) {
+  if (millis() - lastBuzzerToggle >= intervalMs) {
+    lastBuzzerToggle = millis();
+    int state = digitalRead(LED_RED) ? LOW : HIGH;
+    digitalWrite(LED_RED, state);
+    digitalWrite(BUZZER_PIN, state);
+  }
+}
+
+// Bitmap tia sét 16x16 (rõ nét)
+const unsigned char icon_bolt16[] PROGMEM = {
+  0b0000000000000000,
+  0b0000000011000000,
+  0b0000000111100000,
+  0b0000001111110000,
+  0b0000011111111000,
+  0b0000111111111100,
+  0b0000011111111000,
+  0b0000001111110000,
+  0b0000000111100000,
+  0b0000000011000000,
+  0b0000000110000000,
+  0b0000001111000000,
+  0b0000011111100000,
+  0b0000111111110000,
+  0b0000011111100000,
+  0b0000001111000000
+};
+
+void updateDisplay() {
+  // Ưu tiên hiển thị cảnh báo/nguy hiểm
+  if (alertState != "normal") {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print(alertState == "danger" ? "NGUY HIEM!" : "CANH BAO!");
+    display.setCursor(0, 16);
+    display.print("P(W): "); display.print(powerW, 1);
+    display.setCursor(0, 32);
+    display.print("Nguong1: "); display.print(alertThresholdW, 0);
+    display.setCursor(0, 48);
+    display.print("Nguong2: "); display.print(dangerThresholdW, 0);
+    display.display();
+    return;
+  }
+
+  // Màn hình luân phiên mỗi 3s
+  if (millis() - lastScreenSwitch >= 3000) {
+    lastScreenSwitch = millis();
+    screenIndex = (screenIndex + 1) % 3; // giờ có 3 màn hình
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  if (screenIndex == 0) {
+    // Thông số điện (5 mục, bỏ E(kWh))
+    display.print("U(V): "); display.println(voltage, 1);
+    display.print("I(A): "); display.println(currentA, 3);
+    display.print("P(W): "); display.println(powerW, 0);
+    display.print("F(Hz): "); display.println(frequencyHz, 1);
+    display.print("PF: "); display.println(pf, 2);
+  } else if (screenIndex == 1) {
+    // Nhiệt/độ ẩm + relay
+    display.print("Temp(C): "); display.println(tempC, 1);
+    display.print("Hum(%): "); display.println(humPct, 1);
+    display.print("Relay1: "); display.println(relay1 ? "ON" : "OFF");
+    display.print("Relay2: "); display.println(relay2 ? "ON" : "OFF");
+    display.print("Alert: "); display.println(alertEnabled ? "ON" : "OFF");
+  } else if (screenIndex == 2) {
+    // Màn hình riêng hiển thị tổng điện năng với icon
+    display.clearDisplay();
+
+    // Vẽ icon tia sét 16x16
+    display.drawBitmap(0, 0, icon_bolt16, 16, 16, SSD1306_WHITE);
+
+    // Tiêu đề nhỏ gọn bên phải icon
+    display.setTextSize(1);
+    display.setCursor(20, 4);
+    display.print("Tong dien nang");
+
+    // Số liệu to bên dưới, kèm đơn vị kWh (nếu muốn)
+    display.setTextSize(2);
+    display.setCursor(5, 30);
+    display.print(energyKwh, 3);
+    // Nếu muốn hiển thị đơn vị:
+    display.setTextSize(2);
+    display.setCursor(90, 30);
+    display.print("kWh");
+  }
+
+  display.display();
+
+  // Hiển thị chế độ cài đặt (overlay nhỏ)
+  if (settingsMode) {
+    display.fillRect(90, 0, 38, 14, SSD1306_BLACK);
+    display.setCursor(92, 2);
+    display.print("SET");
+    display.display();
+  }
+}
+
+
+// ---- Firebase sync: Sensors ----
+void syncFirebaseSensors() {
+  StaticJsonDocument<512> doc;
+  doc["voltage"] = voltage;
+  doc["current"] = currentA;
+  doc["power"] = powerW;
+  doc["energy_kwh"] = energyKwh;
+  doc["frequency"] = frequencyHz;
+  doc["power_factor"] = pf;
+  doc["temperature_c"] = tempC;
+  doc["humidity_pct"] = humPct;
+  doc["alert_state"] = alertState;
+  doc["last_update"] = (long)millis();
+
+  FirebaseJson j;
+  String out;
+  serializeJson(doc, out);
+  j.setJsonData(out);
+
+  if (!Firebase.RTDB.setJSON(&fbdo, "/esp32/sensors", &j)) {
+    Serial.println("Gửi cảm biến thất bại: " + fbdo.errorReason());
+  }
+}
+
+// ---- Firebase sync: Control ----
+void syncFirebaseControl() {
+  // Relay 1
+  // Relay 1
+// Relay 1
+if (Firebase.RTDB.getBool(&fbdo, "/esp32/control/relay1")) {
+  bool newRelay1 = fbdo.boolData();
+  if (newRelay1 != relay1) {
+    relay1 = newRelay1;
+    applyRelayOutputs();
+    savePrefs();
+    Serial.print("Relay1 cập nhật: "); Serial.println(relay1);
+  }
+}
+
+// Relay 2
+if (Firebase.RTDB.getBool(&fbdo, "/esp32/control/relay2")) {
+  bool newRelay2 = fbdo.boolData();
+  if (newRelay2 != relay2) {
+    relay2 = newRelay2;
+    applyRelayOutputs();
+    savePrefs();
+    Serial.print("Relay2 cập nhật: "); Serial.println(relay2);
+  }
+}
+
+
+
+  // Alert enabled
+  if (Firebase.RTDB.getBool(&fbdo, "/esp32/control/alert_enabled")) {
+    bool newAlertEnabled = fbdo.boolData();
+    if (newAlertEnabled != alertEnabled) {
+      alertEnabled = newAlertEnabled;
+      savePrefs();
+      Serial.print("Alert mode: "); Serial.println(alertEnabled);
+    }
+  }
+
+  // Ngưỡng cảnh báo
+  if (Firebase.RTDB.getFloat(&fbdo, "/esp32/control/alert_threshold_w")) {
+    double newAlertTh = (double)fbdo.floatData();
+    if (abs(newAlertTh - alertThresholdW) > 1.0) {
+      alertThresholdW = newAlertTh;
+      savePrefs();
+      Serial.print("Alert threshold: "); Serial.println(alertThresholdW);
+    }
+  }
+
+  // Ngưỡng nguy hiểm
+  if (Firebase.RTDB.getFloat(&fbdo, "/esp32/control/danger_threshold_w")) {
+    double newDangerTh = (double)fbdo.floatData();
+    if (abs(newDangerTh - dangerThresholdW) > 1.0) {
+      dangerThresholdW = newDangerTh;
+      savePrefs();
+      Serial.print("Danger threshold: "); Serial.println(dangerThresholdW);
+    }
+  }
+
+  // Đọc offset reset từ app nếu có
+if (Firebase.RTDB.getFloat(&fbdo, "/app/reset_offset_kwh")) {
+  double newOffset = fbdo.floatData();
+  if (abs(newOffset - resetOffsetKwh) > 0.001) {
+    resetOffsetKwh = newOffset;
+    savePrefs();
+    Serial.print("Reset offset cập nhật từ app: ");
+    Serial.println(resetOffsetKwh, 3);
+  }
+}
+
+}
+
+
+
+
+
+// ---- History (per-minute) & daily close ----
+String twoDigits(int v) { if (v < 10) return "0" + String(v); return String(v); }
+
+void writeHistoryAndDailyClose() {
+  String currentDate = getFormattedDate(); // Lấy ngày hiện tại: DD-MM-YYYY
+
+  // KIỂM TRA QUA NGÀY MỚI: Nếu ngày hệ thống khác ngày lưu trong bộ nhớ
+  if (lastSavedDate != "" && currentDate != lastSavedDate) {
+    dailyEnergyStartKwh = energyKwh; // Chốt mốc mới là tổng số điện hiện tại
+    lastSavedDate = currentDate;     // Cập nhật ngày mới
+    savePrefs();                     // Lưu lại vào Flash ngay lập tức
+    Serial.println("--- ĐÃ QUA NGÀY MỚI: RESET CHỈ SỐ VỀ 0 ---");
+  } 
+  else if (lastSavedDate == "") {
+    lastSavedDate = currentDate;
+    savePrefs();
+  }
+
+  // TÍNH TOÁN SỐ ĐIỆN THỰC TẾ TRONG NGÀY
+  double dailyUsage = energyKwh - dailyEnergyStartKwh;
+  if (dailyUsage < 0) dailyUsage = 0; // Tránh số âm nếu sensor reset
+
+  // GHI DỮ LIỆU LÊN FIREBASE MỖI 5 GIÂY
+  if (millis() - lastMinuteWriteMs >= 5000) {
+    lastMinuteWriteMs = millis();
+    
+    String timeKey = getFormattedTime();
+    String base = "/esp32/history/" + currentDate;
+    
+    // Ghi vào danh sách timeline (Cột kWh bên phải sẽ bắt đầu từ 0 theo dailyUsage)
+    Firebase.RTDB.setFloat(&fbdo, (base + "/timeline/" + timeKey + "/power_w").c_str(), powerW);
+    Firebase.RTDB.setFloat(&fbdo, (base + "/timeline/" + timeKey + "/energy_kwh").c_str(), dailyUsage);
+    
+    // Ghi vào tổng ngày (Số to ở trên đầu App)
+    Firebase.RTDB.setFloat(&fbdo, (base + "/daily_total_kwh").c_str(), dailyUsage);
+  }
+}
